@@ -55,3 +55,14 @@ run = '''
 samply record --save-only --rate 10000 -o profile.json.gz -- zig-out/bin/1brc "${usage_file}" > /dev/null
 python3 scripts/profile_report.py profile.json.gz zig-out/bin/1brc
 '''
+
+# Zig には独立した linter がないので、未使用の変数なども検出する zig ast-check を lint に使う
+[tasks.quality]
+description = "Run format check, lint, unit tests and sample tests"
+depends = ["test"]
+run = [
+  "zig fmt --check build.zig src",
+  "zig ast-check build.zig",
+  "zig ast-check src/main.zig",
+  "zig test src/main.zig",
+]
