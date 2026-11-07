@@ -16,13 +16,13 @@ const Table = struct {
     const capacity = 1 << 15;
     const Entry = struct { name: []const u8, prefix: Prefix, stats: Stats };
 
-    entries: []Entry,
+    // 64 バイト x 32,768 = 2 MiB
+    // フィールドの初期値にすると 2 MiB の定数がバイナリに入りうるので、init で埋める
+    entries: [capacity]Entry,
 
-    fn init(allocator: std.mem.Allocator) !Table {
-        const entries = try allocator.alloc(Entry, capacity);
+    fn init(self: *Table) void {
         // 観測所名は 1 文字以上なので、空の名前を未使用の印にできる
-        @memset(entries, .{ .name = "", .prefix = @splat(0), .stats = .{} });
-        return .{ .entries = entries };
+        @memset(&self.entries, .{ .name = "", .prefix = @splat(0), .stats = .{} });
     }
 
     // name は mmap した領域内を指し、その領域は main の最後まで有効なので、複製せずにキーにする
@@ -73,10 +73,11 @@ pub fn main(init: std.process.Init) !void {
     }
     for (threads) |thread| thread.join();
 
-    var merged_table: Table = try .init(arena);
+    // main のスタック（macOS の既定で約 8 MiB）に置く
+    var merged_table: Table = undefined;
+    merged_table.init();
     for (workers) |*worker| {
-        if (worker.err) |err| return err;
-        for (worker.table.entries) |*worker_entry| {
+        for (&worker.table.entries) |*worker_entry| {
             if (worker_entry.name.len == 0) continue;
             const merged_stats = merged_table.get(worker_entry.name, worker_entry.prefix);
             merged_stats.min = @min(merged_stats.min, worker_entry.stats.min);
@@ -87,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var sorted_entries: std.ArrayList(*const Table.Entry) = .empty;
-    for (merged_table.entries) |*entry| {
+    for (&merged_table.entries) |*entry| {
         if (entry.name.len > 0) try sorted_entries.append(arena, entry);
     }
     std.mem.sort(*const Table.Entry, sorted_entries.items, {}, nameLessThan);
@@ -126,18 +127,11 @@ const Worker = struct {
 
     file_contents: []const u8,
     next_chunk_index: *std.atomic.Value(usize),
-    arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+    // スレッドの終了後に main が読むので、スレッドのスタックではなく Worker に持たせる
     table: Table = undefined,
-    err: ?anyerror = null,
 
     fn run(worker: *Worker) void {
-        worker.runInner() catch |err| {
-            worker.err = err;
-        };
-    }
-
-    fn runInner(worker: *Worker) !void {
-        worker.table = try .init(worker.arena.allocator());
+        worker.table.init();
         const file_contents = worker.file_contents;
         while (true) {
             const chunk_index = worker.next_chunk_index.fetchAdd(1, .monotonic);
