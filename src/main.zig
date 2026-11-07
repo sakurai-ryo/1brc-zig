@@ -25,7 +25,8 @@ const Table = struct {
         return .{ .entries = entries };
     }
 
-    fn get(self: *Table, allocator: std.mem.Allocator, name: []const u8, prefix: Prefix) !*Stats {
+    // name は mmap した領域内を指し、その領域は main の最後まで有効なので、複製せずにキーにする
+    fn get(self: *Table, name: []const u8, prefix: Prefix) *Stats {
         const prefix_words: [2]u64 = @bitCast(prefix);
         const hash = (prefix_words[0] ^ (prefix_words[1] *% 0x9E3779B97F4A7C15) ^ name.len) *% 0xBF58476D1CE4E5B9;
         // 掛け算の結果は上位ビットほどよく混ざるので、上位 15 ビットを使う
@@ -33,8 +34,7 @@ const Table = struct {
         while (true) : (slot_index +%= 1) {
             const entry = &self.entries[slot_index & (capacity - 1)];
             if (entry.name.len == 0) {
-                // name は次の読み込みで上書きされるバッファを指しているので複製する
-                entry.* = .{ .name = try allocator.dupe(u8, name), .prefix = prefix, .stats = .{} };
+                entry.* = .{ .name = name, .prefix = prefix, .stats = .{} };
                 return &entry.stats;
             }
             if (entry.name.len == name.len and @reduce(.And, entry.prefix == prefix) and
@@ -78,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
         if (worker.err) |err| return err;
         for (worker.table.entries) |*worker_entry| {
             if (worker_entry.name.len == 0) continue;
-            const merged_stats = try merged_table.get(arena, worker_entry.name, worker_entry.prefix);
+            const merged_stats = merged_table.get(worker_entry.name, worker_entry.prefix);
             merged_stats.min = @min(merged_stats.min, worker_entry.stats.min);
             merged_stats.max = @max(merged_stats.max, worker_entry.stats.max);
             merged_stats.sum += worker_entry.stats.sum;
@@ -137,8 +137,7 @@ const Worker = struct {
     }
 
     fn runInner(worker: *Worker) !void {
-        const allocator = worker.arena.allocator();
-        worker.table = try .init(allocator);
+        worker.table = try .init(worker.arena.allocator());
         const file_contents = worker.file_contents;
         while (true) {
             const chunk_index = worker.next_chunk_index.fetchAdd(1, .monotonic);
@@ -146,12 +145,12 @@ const Worker = struct {
             // 塊の境界を次の行頭に合わせ、行頭が [chunk_begin, chunk_end) にある行を担当する
             const chunk_begin = nextLineStart(file_contents, chunk_index * chunk_size);
             const chunk_end = nextLineStart(file_contents, @min((chunk_index + 1) * chunk_size, file_contents.len));
-            try processLines(&worker.table, allocator, file_contents[chunk_begin..@max(chunk_begin, chunk_end)]);
+            processLines(&worker.table, file_contents[chunk_begin..@max(chunk_begin, chunk_end)]);
         }
     }
 };
 
-fn processLines(table: *Table, allocator: std.mem.Allocator, lines: []const u8) !void {
+fn processLines(table: *Table, lines: []const u8) void {
     var cursor: usize = 0;
     while (cursor < lines.len) {
         const name_start = cursor;
@@ -161,7 +160,7 @@ fn processLines(table: *Table, allocator: std.mem.Allocator, lines: []const u8) 
         cursor += 1;
         const temperature = parseTemperature(lines, &cursor);
 
-        const stats = try table.get(allocator, name, prefix);
+        const stats = table.get(name, prefix);
         stats.min = @min(stats.min, temperature);
         stats.max = @max(stats.max, temperature);
         stats.sum += temperature;
@@ -194,7 +193,7 @@ fn scanName(lines: []const u8, cursor: *usize) Prefix {
         return window;
     }
 
-    // バッファ末尾の 16 バイト未満は 1 バイトずつ読む
+    // 担当範囲の末尾の 16 バイト未満は 1 バイトずつ読む
     cursor.* = findSemicolon(lines, name_start);
     var prefix: [16]u8 = @splat(0);
     const copy_len = @min(cursor.* - name_start, 16);
