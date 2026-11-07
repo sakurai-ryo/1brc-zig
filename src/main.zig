@@ -53,26 +53,29 @@ pub fn main(init: std.process.Init) !void {
     const file = try Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
 
-    var table: Table = try .init(arena);
-
-    // ファイル全体を mmap すると、ページキャッシュに収まらないときに 16KB ごとの同期読み込みになって遅い
-    // なので、read() で大きめに読めばカーネルの先読みが効く
-    const buf = try arena.alloc(u8, 1 << 20);
-    var carry: usize = 0;
-    while (true) {
-        const n = file.readStreaming(io, &.{buf[carry..]}) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        const filled = carry + n;
-        // 最後の改行までを処理し、途中で切れた行は次の読み込みの先頭に繰り越す
-        const end = if (std.mem.lastIndexOfScalar(u8, buf[0..filled], '\n')) |i| i + 1 else 0;
-        try process(&table, arena, buf[0..end]);
-        std.mem.copyForwards(u8, buf, buf[end..filled]);
-        carry = filled - end;
+    const len = try file.length(io);
+    var next_chunk: std.atomic.Value(u64) = .init(0);
+    const n_threads = try std.Thread.getCpuCount();
+    const workers = try arena.alloc(Worker, n_threads);
+    const threads = try arena.alloc(std.Thread, n_threads);
+    for (workers, threads) |*w, *t| {
+        w.* = .{ .file = file, .io = io, .len = len, .next_chunk = &next_chunk };
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{w});
     }
-    // 末尾に改行のないファイルの最終行
-    try process(&table, arena, buf[0..carry]);
+    for (threads) |t| t.join();
+
+    var table: Table = try .init(arena);
+    for (workers) |*w| {
+        if (w.err) |err| return err;
+        for (w.table.entries) |*e| {
+            if (e.name.len == 0) continue;
+            const s = try table.get(arena, e.name, e.prefix);
+            s.min = @min(s.min, e.stats.min);
+            s.max = @max(s.max, e.stats.max);
+            s.sum += e.stats.sum;
+            s.count += e.stats.count;
+        }
+    }
 
     var used: std.ArrayList(*const Table.Entry) = .empty;
     for (table.entries) |*e| {
@@ -96,6 +99,72 @@ pub fn main(init: std.process.Init) !void {
     try out.writeAll("}\n");
     try out.flush();
 }
+
+// offset 以降で最初の行頭の位置を返す。offset がすでに行頭ならそのまま返す
+fn nextLineStart(file: Io.File, io: Io, offset: u64) !u64 {
+    if (offset == 0) return 0;
+    // 1 行は最長で 100 (名前) + 1 + 5 (気温) + 1 バイトなので、128 バイト読めば改行が見つかる
+    var buf: [128]u8 = undefined;
+    const n = try file.readPositionalAll(io, &buf, offset - 1);
+    const i = std.mem.indexOfScalar(u8, buf[0..n], '\n') orelse return offset - 1 + n;
+    return offset + i;
+}
+
+// ファイルを chunk_size ごとの塊に分け、各スレッドが空き次第つぎの塊を取って処理する。
+// 均等に分けると、Apple Silicon では高性能コアのスレッドが先に終わって高効率コアを待つことになる。
+// 表とメモリはスレッドごとに持つので、塊の取得以外にスレッド間の同期は要らない
+const Worker = struct {
+    const chunk_size = 16 << 20;
+
+    file: Io.File,
+    io: Io,
+    len: u64,
+    next_chunk: *std.atomic.Value(u64),
+    arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+    table: Table = undefined,
+    err: ?anyerror = null,
+
+    fn run(w: *Worker) void {
+        w.runInner() catch |err| {
+            w.err = err;
+        };
+    }
+
+    fn runInner(w: *Worker) !void {
+        const gpa = w.arena.allocator();
+        w.table = try .init(gpa);
+        // ファイル全体を mmap すると、ページキャッシュに収まらないときに 16KB ごとの同期読み込みになって遅い
+        // なので、read() で大きめに読めばカーネルの先読みが効く
+        const buf = try gpa.alloc(u8, 1 << 20);
+        while (true) {
+            const i = w.next_chunk.fetchAdd(1, .monotonic);
+            if (i * chunk_size >= w.len) break;
+            // 塊の境界を次の行頭に合わせ、行頭が [begin, end) にある行を担当する
+            const begin = try nextLineStart(w.file, w.io, i * chunk_size);
+            const end = try nextLineStart(w.file, w.io, @min((i + 1) * chunk_size, w.len));
+            try w.processRange(gpa, buf, begin, end);
+        }
+    }
+
+    fn processRange(w: *Worker, gpa: std.mem.Allocator, buf: []u8, begin: u64, end: u64) !void {
+        var carry: usize = 0;
+        var offset = begin;
+        while (offset < end) {
+            const want: usize = @intCast(@min(buf.len - carry, end - offset));
+            const n = try w.file.readPositional(w.io, &.{buf[carry..][0..want]}, offset);
+            if (n == 0) break;
+            offset += n;
+            const filled = carry + n;
+            // 最後の改行までを処理し、途中で切れた行は次の読み込みの先頭に繰り越す
+            const stop = if (std.mem.lastIndexOfScalar(u8, buf[0..filled], '\n')) |i| i + 1 else 0;
+            try process(&w.table, gpa, buf[0..stop]);
+            std.mem.copyForwards(u8, buf, buf[stop..filled]);
+            carry = filled - stop;
+        }
+        // 末尾に改行のないファイルの最終行
+        try process(&w.table, gpa, buf[0..carry]);
+    }
+};
 
 fn process(table: *Table, gpa: std.mem.Allocator, data: []const u8) !void {
     var pos: usize = 0;
