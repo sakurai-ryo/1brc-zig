@@ -18,27 +18,27 @@ const Table = struct {
 
     entries: []Entry,
 
-    fn init(gpa: std.mem.Allocator) !Table {
-        const entries = try gpa.alloc(Entry, capacity);
+    fn init(allocator: std.mem.Allocator) !Table {
+        const entries = try allocator.alloc(Entry, capacity);
         // 観測所名は 1 文字以上なので、空の名前を未使用の印にできる
         @memset(entries, .{ .name = "", .prefix = @splat(0), .stats = .{} });
         return .{ .entries = entries };
     }
 
-    fn get(self: *Table, gpa: std.mem.Allocator, name: []const u8, prefix: Prefix) !*Stats {
-        const words: [2]u64 = @bitCast(prefix);
-        const h = (words[0] ^ (words[1] *% 0x9E3779B97F4A7C15) ^ name.len) *% 0xBF58476D1CE4E5B9;
+    fn get(self: *Table, allocator: std.mem.Allocator, name: []const u8, prefix: Prefix) !*Stats {
+        const prefix_words: [2]u64 = @bitCast(prefix);
+        const hash = (prefix_words[0] ^ (prefix_words[1] *% 0x9E3779B97F4A7C15) ^ name.len) *% 0xBF58476D1CE4E5B9;
         // 掛け算の結果は上位ビットほどよく混ざるので、上位 15 ビットを使う
-        var i: usize = @intCast(h >> (64 - 15));
-        while (true) : (i +%= 1) {
-            const e = &self.entries[i & (capacity - 1)];
-            if (e.name.len == 0) {
+        var slot_index: usize = @intCast(hash >> (64 - 15));
+        while (true) : (slot_index +%= 1) {
+            const entry = &self.entries[slot_index & (capacity - 1)];
+            if (entry.name.len == 0) {
                 // name は次の読み込みで上書きされるバッファを指しているので複製する
-                e.* = .{ .name = try gpa.dupe(u8, name), .prefix = prefix, .stats = .{} };
-                return &e.stats;
+                entry.* = .{ .name = try allocator.dupe(u8, name), .prefix = prefix, .stats = .{} };
+                return &entry.stats;
             }
-            if (e.name.len == name.len and @reduce(.And, e.prefix == prefix) and
-                (name.len <= 16 or std.mem.eql(u8, e.name[16..], name[16..]))) return &e.stats;
+            if (entry.name.len == name.len and @reduce(.And, entry.prefix == prefix) and
+                (name.len <= 16 or std.mem.eql(u8, entry.name[16..], name[16..]))) return &entry.stats;
         }
     }
 };
@@ -53,68 +53,68 @@ pub fn main(init: std.process.Init) !void {
     const file = try Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
 
-    const len = try file.length(io);
+    const file_size = try file.length(io);
     // 長さ 0 の mmap は失敗するので、空ファイルは読まずに済ませる
-    var mm: ?Io.File.MemoryMap = if (len == 0) null else try file.createMemoryMap(io, .{
-        .len = len,
+    var memory_map: ?Io.File.MemoryMap = if (file_size == 0) null else try file.createMemoryMap(io, .{
+        .len = file_size,
         .protection = .{ .read = true },
         .populate = false,
     });
-    defer if (mm) |*m| m.destroy(io);
-    const data: []const u8 = if (mm) |m| m.memory else "";
+    defer if (memory_map) |*map| map.destroy(io);
+    const file_contents: []const u8 = if (memory_map) |map| map.memory else "";
 
-    var next_chunk: std.atomic.Value(usize) = .init(0);
-    const n_threads = try std.Thread.getCpuCount();
-    const workers = try arena.alloc(Worker, n_threads);
-    const threads = try arena.alloc(std.Thread, n_threads);
-    for (workers, threads) |*w, *t| {
-        w.* = .{ .data = data, .next_chunk = &next_chunk };
-        t.* = try std.Thread.spawn(.{}, Worker.run, .{w});
+    var next_chunk_index: std.atomic.Value(usize) = .init(0);
+    const thread_count = try std.Thread.getCpuCount();
+    const workers = try arena.alloc(Worker, thread_count);
+    const threads = try arena.alloc(std.Thread, thread_count);
+    for (workers, threads) |*worker, *thread| {
+        worker.* = .{ .file_contents = file_contents, .next_chunk_index = &next_chunk_index };
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
     }
-    for (threads) |t| t.join();
+    for (threads) |thread| thread.join();
 
-    var table: Table = try .init(arena);
-    for (workers) |*w| {
-        if (w.err) |err| return err;
-        for (w.table.entries) |*e| {
-            if (e.name.len == 0) continue;
-            const s = try table.get(arena, e.name, e.prefix);
-            s.min = @min(s.min, e.stats.min);
-            s.max = @max(s.max, e.stats.max);
-            s.sum += e.stats.sum;
-            s.count += e.stats.count;
+    var merged_table: Table = try .init(arena);
+    for (workers) |*worker| {
+        if (worker.err) |err| return err;
+        for (worker.table.entries) |*worker_entry| {
+            if (worker_entry.name.len == 0) continue;
+            const merged_stats = try merged_table.get(arena, worker_entry.name, worker_entry.prefix);
+            merged_stats.min = @min(merged_stats.min, worker_entry.stats.min);
+            merged_stats.max = @max(merged_stats.max, worker_entry.stats.max);
+            merged_stats.sum += worker_entry.stats.sum;
+            merged_stats.count += worker_entry.stats.count;
         }
     }
 
-    var used: std.ArrayList(*const Table.Entry) = .empty;
-    for (table.entries) |*e| {
-        if (e.name.len > 0) try used.append(arena, e);
+    var sorted_entries: std.ArrayList(*const Table.Entry) = .empty;
+    for (merged_table.entries) |*entry| {
+        if (entry.name.len > 0) try sorted_entries.append(arena, entry);
     }
-    std.mem.sort(*const Table.Entry, used.items, {}, lessThan);
+    std.mem.sort(*const Table.Entry, sorted_entries.items, {}, nameLessThan);
 
     var stdout_buffer: [64 * 1024]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const out = &stdout_writer.interface;
+    const stdout = &stdout_writer.interface;
 
-    try out.writeAll("{");
-    for (used.items, 0..) |e, n| {
-        const s = e.stats;
+    try stdout.writeAll("{");
+    for (sorted_entries.items, 0..) |entry, entry_index| {
+        const stats = entry.stats;
         // baseline は f64 の合計を一度丸めてから 10 で割り、件数で割って丸める。
         // 丸めた合計は整数の合計と一致するので、それ以降を同じ順序で f64 で計算する
-        const mean = round(tenths(s.sum) / @as(f64, @floatFromInt(s.count)));
-        if (n > 0) try out.writeAll(", ");
-        try out.print("{s}={d:.1}/{d:.1}/{d:.1}", .{ e.name, tenths(s.min), mean, tenths(s.max) });
+        const mean = roundToTenth(tenthsToFloat(stats.sum) / @as(f64, @floatFromInt(stats.count)));
+        if (entry_index > 0) try stdout.writeAll(", ");
+        try stdout.print("{s}={d:.1}/{d:.1}/{d:.1}", .{ entry.name, tenthsToFloat(stats.min), mean, tenthsToFloat(stats.max) });
     }
-    try out.writeAll("}\n");
-    try out.flush();
+    try stdout.writeAll("}\n");
+    try stdout.flush();
 }
 
 // offset 以降で最初の行頭の位置を返す
 // offset がすでに行頭ならそのまま返す
-fn nextLineStart(data: []const u8, offset: usize) usize {
+fn nextLineStart(file_contents: []const u8, offset: usize) usize {
     if (offset == 0) return 0;
-    const i = std.mem.indexOfScalarPos(u8, data, offset - 1, '\n') orelse return data.len;
-    return i + 1;
+    const newline_index = std.mem.indexOfScalarPos(u8, file_contents, offset - 1, '\n') orelse return file_contents.len;
+    return newline_index + 1;
 }
 
 // ファイルを chunk_size ごとの塊に分け、各スレッドが空き次第つぎの塊を取って処理する
@@ -124,46 +124,48 @@ const Worker = struct {
     // 16 MiB
     const chunk_size = 16 << 20;
 
-    data: []const u8,
-    next_chunk: *std.atomic.Value(usize),
+    file_contents: []const u8,
+    next_chunk_index: *std.atomic.Value(usize),
     arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
     table: Table = undefined,
     err: ?anyerror = null,
 
-    fn run(w: *Worker) void {
-        w.runInner() catch |err| {
-            w.err = err;
+    fn run(worker: *Worker) void {
+        worker.runInner() catch |err| {
+            worker.err = err;
         };
     }
 
-    fn runInner(w: *Worker) !void {
-        const gpa = w.arena.allocator();
-        w.table = try .init(gpa);
+    fn runInner(worker: *Worker) !void {
+        const allocator = worker.arena.allocator();
+        worker.table = try .init(allocator);
+        const file_contents = worker.file_contents;
         while (true) {
-            const i = w.next_chunk.fetchAdd(1, .monotonic);
-            if (i * chunk_size >= w.data.len) break;
-            // 塊の境界を次の行頭に合わせ、行頭が [begin, end) にある行を担当する
-            const begin = nextLineStart(w.data, i * chunk_size);
-            const end = nextLineStart(w.data, @min((i + 1) * chunk_size, w.data.len));
-            try process(&w.table, gpa, w.data[begin..@max(begin, end)]);
+            const chunk_index = worker.next_chunk_index.fetchAdd(1, .monotonic);
+            if (chunk_index * chunk_size >= file_contents.len) break;
+            // 塊の境界を次の行頭に合わせ、行頭が [chunk_begin, chunk_end) にある行を担当する
+            const chunk_begin = nextLineStart(file_contents, chunk_index * chunk_size);
+            const chunk_end = nextLineStart(file_contents, @min((chunk_index + 1) * chunk_size, file_contents.len));
+            try processLines(&worker.table, allocator, file_contents[chunk_begin..@max(chunk_begin, chunk_end)]);
         }
     }
 };
 
-fn process(table: *Table, gpa: std.mem.Allocator, data: []const u8) !void {
-    var pos: usize = 0;
-    while (pos < data.len) {
-        const start = pos;
-        const prefix = scanName(data, &pos);
-        const name = data[start..pos];
-        pos += 1;
-        const value = parseTemp(data, &pos);
+fn processLines(table: *Table, allocator: std.mem.Allocator, lines: []const u8) !void {
+    var cursor: usize = 0;
+    while (cursor < lines.len) {
+        const name_start = cursor;
+        const prefix = scanName(lines, &cursor);
+        const name = lines[name_start..cursor];
+        // ';' を飛ばす
+        cursor += 1;
+        const temperature = parseTemperature(lines, &cursor);
 
-        const s = try table.get(gpa, name, prefix);
-        s.min = @min(s.min, value);
-        s.max = @max(s.max, value);
-        s.sum += value;
-        s.count += 1;
+        const stats = try table.get(allocator, name, prefix);
+        stats.min = @min(stats.min, temperature);
+        stats.max = @max(stats.max, temperature);
+        stats.sum += temperature;
+        stats.count += 1;
     }
 }
 
@@ -172,82 +174,83 @@ fn process(table: *Table, gpa: std.mem.Allocator, data: []const u8) !void {
 // ';' を探すときに読んだバイト列を、ハッシュと比較にそのまま使い回すために持つ
 const Prefix = @Vector(16, u8);
 
-// data[pos..] の観測所名を読み、pos を ';' の位置に進めて、名前の先頭 16 バイトを返す
-fn scanName(data: []const u8, pos: *usize) Prefix {
-    const start = pos.*;
-    if (start + 16 <= data.len) {
-        const chunk: Prefix = data[start..][0..16].*;
-        const mask: u16 = @bitCast(chunk == @as(Prefix, @splat(';')));
-        if (mask != 0) {
-            const len: u8 = @ctz(mask);
-            pos.* = start + len;
-            // chunk には ';' 以降（気温や次の行）も入っているので、名前の部分だけ残して 0 で埋める
+// lines[cursor..] の観測所名を読み、cursor を ';' の位置に進めて、名前の先頭 16 バイトを返す
+fn scanName(lines: []const u8, cursor: *usize) Prefix {
+    const name_start = cursor.*;
+    if (name_start + 16 <= lines.len) {
+        const window: Prefix = lines[name_start..][0..16].*;
+        const semicolon_bits: u16 = @bitCast(window == @as(Prefix, @splat(';')));
+        if (semicolon_bits != 0) {
+            const name_len: u8 = @ctz(semicolon_bits);
+            cursor.* = name_start + name_len;
+            // window には ';' 以降（気温や次の行）も入っているので、名前の部分だけ残して 0 で埋める
             // 同じ観測所でも後ろに続く内容は行ごとに違い、そのままではハッシュと比較が一致しない
-            // iota は { 0, 1, ..., 15 } で、len 未満のレーンだけ keep が true になる
-            // 例: "Hamburg;12.0\nBul" (len = 7) -> "Hamburg" + 0 x 9
-            const keep = std.simd.iota(u8, 16) < @as(Prefix, @splat(len));
-            return @select(u8, keep, chunk, @as(Prefix, @splat(0)));
+            // iota は { 0, 1, ..., 15 } で、name_len 未満のレーンだけ is_name_byte が true になる
+            // 例: "Hamburg;12.0\nBul" (name_len = 7) -> "Hamburg" + 0 x 9
+            const is_name_byte = std.simd.iota(u8, 16) < @as(Prefix, @splat(name_len));
+            return @select(u8, is_name_byte, window, @as(Prefix, @splat(0)));
         }
-        pos.* = findSemicolon(data, start + 16);
-        return chunk;
+        cursor.* = findSemicolon(lines, name_start + 16);
+        return window;
     }
 
     // バッファ末尾の 16 バイト未満は 1 バイトずつ読む
-    pos.* = findSemicolon(data, start);
+    cursor.* = findSemicolon(lines, name_start);
     var prefix: [16]u8 = @splat(0);
-    const n = @min(pos.* - start, 16);
-    @memcpy(prefix[0..n], data[start..][0..n]);
+    const copy_len = @min(cursor.* - name_start, 16);
+    @memcpy(prefix[0..copy_len], lines[name_start..][0..copy_len]);
     return prefix;
 }
 
 // 16 バイトずつまとめて ';' と比べ、最初に一致した位置を返す
-fn findSemicolon(data: []const u8, start: usize) usize {
-    var i = start;
-    while (i + 16 <= data.len) : (i += 16) {
-        const chunk: Prefix = data[i..][0..16].*;
+fn findSemicolon(lines: []const u8, search_start: usize) usize {
+    var window_start = search_start;
+    while (window_start + 16 <= lines.len) : (window_start += 16) {
+        const window: Prefix = lines[window_start..][0..16].*;
         // @splat(';') は 0x3B を 16 レーンに並べたベクトル
         // レーンごとに比べた結果を u16 にすると ';' の位置のビットが立つ（レーン 0 が最下位ビット）
         // `==` はレーンごとの比較
         // 例: "Hamburg;12.0\nBul" -> 0x0080
         //     @ctz で最初の ';' の位置 7 が分かる
-        const mask: u16 = @bitCast(chunk == @as(Prefix, @splat(';')));
-        if (mask != 0) return i + @ctz(mask);
+        const semicolon_bits: u16 = @bitCast(window == @as(Prefix, @splat(';')));
+        if (semicolon_bits != 0) return window_start + @ctz(semicolon_bits);
     }
     // ファイル末尾の 16 バイト未満は 1 バイトずつ探す
-    while (data[i] != ';') i += 1;
-    return i;
+    var index = window_start;
+    while (lines[index] != ';') index += 1;
+    return index;
 }
 
-fn lessThan(_: void, a: *const Table.Entry, b: *const Table.Entry) bool {
-    return std.mem.lessThan(u8, a.name, b.name);
+fn nameLessThan(_: void, lhs: *const Table.Entry, rhs: *const Table.Entry) bool {
+    return std.mem.lessThan(u8, lhs.name, rhs.name);
 }
 
-// data[pos..] の "-12.3\n" を -123 として読み、pos を次の行の先頭に進める
+// lines[cursor..] の "-12.3\n" を -123 として読み、cursor を次の行の先頭に進める
 // 整数部が 1〜2 桁、小数部が 1 桁という形式を前提に、改行を探さずに読み進める
-fn parseTemp(data: []const u8, pos: *usize) i32 {
-    var i = pos.*;
-    const neg = data[i] == '-';
-    if (neg) i += 1;
+fn parseTemperature(lines: []const u8, cursor: *usize) i32 {
+    var index = cursor.*;
+    const is_negative = lines[index] == '-';
+    if (is_negative) index += 1;
     // 1 桁目
-    var v: i32 = asciiToDigit(data[i]);
-    i += 1;
+    var tenths: i32 = asciiToDigit(lines[index]);
+    index += 1;
 
     // 2 桁目（存在すれば）
-    if (data[i] != '.') {
-        v = v * 10 + asciiToDigit(data[i]);
-        i += 1;
+    if (lines[index] != '.') {
+        tenths = tenths * 10 + asciiToDigit(lines[index]);
+        index += 1;
     }
 
     // 小数部の 1 桁目
-    v = v * 10 + asciiToDigit(data[i + 1]);
+    tenths = tenths * 10 + asciiToDigit(lines[index + 1]);
 
     // '.'、小数部、'\n' の 3 バイトを飛ばす
-    pos.* = i + 3;
-    return if (neg) -v else v;
+    cursor.* = index + 3;
+    return if (is_negative) -tenths else tenths;
 }
 
-fn asciiToDigit(c: u8) u8 {
-    return c - '0';
+fn asciiToDigit(char: u8) u8 {
+    return char - '0';
 }
 
 test "asciiToDigit" {
@@ -257,10 +260,12 @@ test "asciiToDigit" {
     try expect(asciiToDigit('9') == 9);
 }
 
-fn tenths(v: anytype) f64 {
-    return @as(f64, @floatFromInt(v)) / 10.0;
+// 0.1 度単位の整数を、度単位の f64 に変換する
+fn tenthsToFloat(tenths: anytype) f64 {
+    return @as(f64, @floatFromInt(tenths)) / 10.0;
 }
 
-fn round(x: f64) f64 {
-    return @floor(x * 10.0 + 0.5) / 10.0;
+// Java の Math.round(value * 10.0) / 10.0 と同じ丸め
+fn roundToTenth(value: f64) f64 {
+    return @floor(value * 10.0 + 0.5) / 10.0;
 }
