@@ -14,28 +14,31 @@ const Stats = struct {
 const Table = struct {
     // リサイズしないので、観測所の最大数 10,000 より十分大きく取る（負荷率 1/3 未満）
     const capacity = 1 << 15;
-    const Entry = struct { name: []const u8, stats: Stats };
+    const Entry = struct { name: []const u8, prefix: Prefix, stats: Stats };
 
     entries: []Entry,
 
     fn init(gpa: std.mem.Allocator) !Table {
         const entries = try gpa.alloc(Entry, capacity);
         // 観測所名は 1 文字以上なので、空の名前を未使用の印にできる
-        @memset(entries, .{ .name = "", .stats = .{} });
+        @memset(entries, .{ .name = "", .prefix = @splat(0), .stats = .{} });
         return .{ .entries = entries };
     }
 
-    fn get(self: *Table, gpa: std.mem.Allocator, name: []const u8) !*Stats {
-        var i: usize = @truncate(std.hash.Wyhash.hash(0, name));
+    fn get(self: *Table, gpa: std.mem.Allocator, name: []const u8, prefix: Prefix) !*Stats {
+        const words: [2]u64 = @bitCast(prefix);
+        const h = (words[0] ^ (words[1] *% 0x9E3779B97F4A7C15) ^ name.len) *% 0xBF58476D1CE4E5B9;
+        // 掛け算の結果は上位ビットほどよく混ざるので、上位 15 ビットを使う
+        var i: usize = @intCast(h >> (64 - 15));
         while (true) : (i +%= 1) {
-            // 下位 15 ビットだけを使ってインデックスを計算する
             const e = &self.entries[i & (capacity - 1)];
             if (e.name.len == 0) {
                 // name は次の読み込みで上書きされるバッファを指しているので複製する
-                e.name = try gpa.dupe(u8, name);
+                e.* = .{ .name = try gpa.dupe(u8, name), .prefix = prefix, .stats = .{} };
                 return &e.stats;
             }
-            if (std.mem.eql(u8, e.name, name)) return &e.stats;
+            if (e.name.len == name.len and @reduce(.And, e.prefix == prefix) and
+                (name.len <= 16 or std.mem.eql(u8, e.name[16..], name[16..]))) return &e.stats;
         }
     }
 };
@@ -98,12 +101,12 @@ fn process(table: *Table, gpa: std.mem.Allocator, data: []const u8) !void {
     var pos: usize = 0;
     while (pos < data.len) {
         const start = pos;
-        pos = findSemicolon(data, pos);
+        const prefix = scanName(data, &pos);
         const name = data[start..pos];
         pos += 1;
         const value = parseTemp(data, &pos);
 
-        const s = try table.get(gpa, name);
+        const s = try table.get(gpa, name, prefix);
         s.min = @min(s.min, value);
         s.max = @max(s.max, value);
         s.sum += value;
@@ -111,13 +114,40 @@ fn process(table: *Table, gpa: std.mem.Allocator, data: []const u8) !void {
     }
 }
 
+// 観測所名の先頭 16 バイト
+// 名前より後ろは 0 で埋める
+// ';' を探すときに読んだバイト列を、ハッシュと比較にそのまま使い回すために持つ
+const Prefix = @Vector(16, u8);
+
+// data[pos..] の観測所名を読み、pos を ';' の位置に進めて、名前の先頭 16 バイトを返す
+fn scanName(data: []const u8, pos: *usize) Prefix {
+    const start = pos.*;
+    if (start + 16 <= data.len) {
+        const chunk: Prefix = data[start..][0..16].*;
+        const mask: u16 = @bitCast(chunk == @as(Prefix, @splat(';')));
+        if (mask != 0) {
+            const len: u8 = @ctz(mask);
+            pos.* = start + len;
+            const keep = std.simd.iota(u8, 16) < @as(Prefix, @splat(len));
+            return @select(u8, keep, chunk, @as(Prefix, @splat(0)));
+        }
+        pos.* = findSemicolon(data, start + 16);
+        return chunk;
+    }
+    // バッファ末尾の 16 バイト未満は 1 バイトずつ読む
+    pos.* = findSemicolon(data, start);
+    var prefix: [16]u8 = @splat(0);
+    const n = @min(pos.* - start, 16);
+    @memcpy(prefix[0..n], data[start..][0..n]);
+    return prefix;
+}
+
 // 16 バイトずつまとめて ';' と比べ、最初に一致した位置を返す
 fn findSemicolon(data: []const u8, start: usize) usize {
-    const V = @Vector(16, u8);
     var i = start;
     while (i + 16 <= data.len) : (i += 16) {
-        const chunk: V = data[i..][0..16].*;
-        const mask: u16 = @bitCast(chunk == @as(V, @splat(';')));
+        const chunk: Prefix = data[i..][0..16].*;
+        const mask: u16 = @bitCast(chunk == @as(Prefix, @splat(';')));
         if (mask != 0) return i + @ctz(mask);
     }
     // ファイル末尾の 16 バイト未満は 1 バイトずつ探す
@@ -129,19 +159,25 @@ fn lessThan(_: void, a: *const Table.Entry, b: *const Table.Entry) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
-// data[pos..] の "-12.3\n" を -123 として読み、pos を次の行の先頭に進める。
+// data[pos..] の "-12.3\n" を -123 として読み、pos を次の行の先頭に進める
 // 整数部が 1〜2 桁、小数部が 1 桁という形式を前提に、改行を探さずに読み進める
 fn parseTemp(data: []const u8, pos: *usize) i32 {
     var i = pos.*;
     const neg = data[i] == '-';
     if (neg) i += 1;
+    // 1 桁目
     var v: i32 = asciiToDigit(data[i]);
     i += 1;
+
+    // 2 桁目（存在すれば）
     if (data[i] != '.') {
         v = v * 10 + asciiToDigit(data[i]);
         i += 1;
     }
+
+    // 小数部の 1 桁目
     v = v * 10 + asciiToDigit(data[i + 1]);
+
     // '.'、小数部、'\n' の 3 バイトを飛ばす
     pos.* = i + 3;
     return if (neg) -v else v;
