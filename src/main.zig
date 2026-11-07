@@ -18,7 +18,8 @@ const Table = struct {
 
     // 64 バイト x 32,768 = 2 MiB
     // フィールドの初期値にすると 2 MiB の定数がバイナリに入りうるので、init で埋める
-    entries: [capacity]Entry,
+    // Entry は 64 バイトなので、先頭を 64 バイト境界に揃えないと各エントリが 2 本のキャッシュラインにまたがる
+    entries: [capacity]Entry align(64),
 
     fn init(self: *Table) void {
         // 観測所名は 1 文字以上なので、空の名前を未使用の印にできる
@@ -27,9 +28,18 @@ const Table = struct {
 
     // name は mmap した領域内を指し、その領域は main の最後まで有効なので、複製せずにキーにする
     fn get(self: *Table, name: []const u8, prefix: Prefix) *Stats {
+        // ハッシュは、';' を探すときに読んだ先頭 16 バイトと長さだけから作る
+        // 16 バイトを超える部分はハッシュに使わないが、一致の判定では std.mem.eql で比べるので結果は正しい
+        //
+        // 1. 先頭 16 バイトを 2 つの u64 とみなす（リトルエンディアンなので 1 文字目が最下位バイト）
+        //    例: "Hamburg" -> [0] = 0x00677275626d6148 ("Hamburg\0"), [1] = 0
         const prefix_words: [2]u64 = @bitCast(prefix);
-        const hash = (prefix_words[0] ^ (prefix_words[1] *% 0x9E3779B97F4A7C15) ^ name.len) *% 0xBF58476D1CE4E5B9;
-        // 掛け算の結果は上位ビットほどよく混ざるので、上位 15 ビットを使う
+        // 2. 2 つの u64 と長さを XOR で 1 つにまとめ、定数を 1 回掛ける
+        //    単純な XOR だと前半と後半の 8 バイトが入れ替わった名前が衝突するので、後半は回転させてから混ぜる
+        //    定数は 2^64 / 黄金比に近い奇数（Fibonacci hashing の定番）
+        const hash = (prefix_words[0] ^ std.math.rotl(u64, prefix_words[1], 32) ^ name.len) *% 0x9E3779B97F4A7C15;
+        // 3. 掛け算では各入力ビットがそれより上位のビットにしか影響しないので、上位ビットほどよく混ざっている。
+        //    表は 2^15 枠なので、上位 15 ビットを枠番号にする（例: "Hamburg" -> 31193）
         var slot_index: usize = @intCast(hash >> (64 - 15));
         while (true) : (slot_index +%= 1) {
             const entry = &self.entries[slot_index & (capacity - 1)];
@@ -183,6 +193,7 @@ fn scanName(lines: []const u8, cursor: *usize) Prefix {
             const is_name_byte = std.simd.iota(u8, 16) < @as(Prefix, @splat(name_len));
             return @select(u8, is_name_byte, window, @as(Prefix, @splat(0)));
         }
+        // 16 bit までに ';' がないケースはそのまま prefix とする
         cursor.* = findSemicolon(lines, name_start + 16);
         return window;
     }
