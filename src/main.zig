@@ -1,10 +1,11 @@
 const std = @import("std");
 const Io = std.Io;
 
+// 気温は小数部が必ず 1 桁なので、0.1 度単位の整数で正確に持てる
 const Stats = struct {
-    min: f64 = std.math.inf(f64),
-    max: f64 = -std.math.inf(f64),
-    sum: f64 = 0,
+    min: i32 = std.math.maxInt(i32),
+    max: i32 = std.math.minInt(i32),
+    sum: i64 = 0,
     count: u64 = 0,
 };
 
@@ -49,22 +50,26 @@ pub fn main(init: std.process.Init) !void {
     const file = try Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
 
-    var read_buffer: [64 * 1024]u8 = undefined;
-    var file_reader: Io.File.Reader = .init(file, io, &read_buffer);
-    const reader = &file_reader.interface;
-
     var table: Table = try .init(arena);
 
-    while (try reader.takeDelimiter('\n')) |line| {
-        const sep = std.mem.lastIndexOfScalar(u8, line, ';').?;
-        const value = try std.fmt.parseFloat(f64, line[sep + 1 ..]);
-
-        const s = try table.get(arena, line[0..sep]);
-        s.min = @min(s.min, value);
-        s.max = @max(s.max, value);
-        s.sum += value;
-        s.count += 1;
+    // ファイル全体を mmap すると、ページキャッシュに収まらないときに 16KB ごとの同期読み込みになって遅い
+    // なので、read() で大きめに読めばカーネルの先読みが効く
+    const buf = try arena.alloc(u8, 1 << 20);
+    var carry: usize = 0;
+    while (true) {
+        const n = file.readStreaming(io, &.{buf[carry..]}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        const filled = carry + n;
+        // 最後の改行までを処理し、途中で切れた行は次の読み込みの先頭に繰り越す
+        const end = if (std.mem.lastIndexOfScalar(u8, buf[0..filled], '\n')) |i| i + 1 else 0;
+        try process(&table, arena, buf[0..end]);
+        std.mem.copyForwards(u8, buf, buf[end..filled]);
+        carry = filled - end;
     }
+    // 末尾に改行のないファイルの最終行
+    try process(&table, arena, buf[0..carry]);
 
     var used: std.ArrayList(*const Table.Entry) = .empty;
     for (table.entries) |*e| {
@@ -79,17 +84,82 @@ pub fn main(init: std.process.Init) !void {
     try out.writeAll("{");
     for (used.items, 0..) |e, n| {
         const s = e.stats;
-        // baseline と同じく、合計を一度丸めてから件数で割る
-        const mean = round(round(s.sum) / @as(f64, @floatFromInt(s.count)));
+        // baseline は f64 の合計を一度丸めてから 10 で割り、件数で割って丸める。
+        // 丸めた合計は整数の合計と一致するので、それ以降を同じ順序で f64 で計算する
+        const mean = round(tenths(s.sum) / @as(f64, @floatFromInt(s.count)));
         if (n > 0) try out.writeAll(", ");
-        try out.print("{s}={d:.1}/{d:.1}/{d:.1}", .{ e.name, round(s.min), mean, round(s.max) });
+        try out.print("{s}={d:.1}/{d:.1}/{d:.1}", .{ e.name, tenths(s.min), mean, tenths(s.max) });
     }
     try out.writeAll("}\n");
     try out.flush();
 }
 
+fn process(table: *Table, gpa: std.mem.Allocator, data: []const u8) !void {
+    var pos: usize = 0;
+    while (pos < data.len) {
+        const start = pos;
+        pos = findSemicolon(data, pos);
+        const name = data[start..pos];
+        pos += 1;
+        const value = parseTemp(data, &pos);
+
+        const s = try table.get(gpa, name);
+        s.min = @min(s.min, value);
+        s.max = @max(s.max, value);
+        s.sum += value;
+        s.count += 1;
+    }
+}
+
+// 16 バイトずつまとめて ';' と比べ、最初に一致した位置を返す
+fn findSemicolon(data: []const u8, start: usize) usize {
+    const V = @Vector(16, u8);
+    var i = start;
+    while (i + 16 <= data.len) : (i += 16) {
+        const chunk: V = data[i..][0..16].*;
+        const mask: u16 = @bitCast(chunk == @as(V, @splat(';')));
+        if (mask != 0) return i + @ctz(mask);
+    }
+    // ファイル末尾の 16 バイト未満は 1 バイトずつ探す
+    while (data[i] != ';') i += 1;
+    return i;
+}
+
 fn lessThan(_: void, a: *const Table.Entry, b: *const Table.Entry) bool {
     return std.mem.lessThan(u8, a.name, b.name);
+}
+
+// data[pos..] の "-12.3\n" を -123 として読み、pos を次の行の先頭に進める。
+// 整数部が 1〜2 桁、小数部が 1 桁という形式を前提に、改行を探さずに読み進める
+fn parseTemp(data: []const u8, pos: *usize) i32 {
+    var i = pos.*;
+    const neg = data[i] == '-';
+    if (neg) i += 1;
+    var v: i32 = asciiToDigit(data[i]);
+    i += 1;
+    if (data[i] != '.') {
+        v = v * 10 + asciiToDigit(data[i]);
+        i += 1;
+    }
+    v = v * 10 + asciiToDigit(data[i + 1]);
+    // '.'、小数部、'\n' の 3 バイトを飛ばす
+    pos.* = i + 3;
+    return if (neg) -v else v;
+}
+
+fn asciiToDigit(c: u8) u8 {
+    return c - '0';
+}
+
+test "asciiToDigit" {
+    const expect = std.testing.expect;
+    try expect(asciiToDigit('0') == 0);
+    try expect(asciiToDigit('1') == 1);
+    try expect(asciiToDigit('9') == 9);
+}
+
+fn tenths(v: anytype) f64 {
+    return @as(f64, @floatFromInt(v)) / 10.0;
 }
 
 fn round(x: f64) f64 {
