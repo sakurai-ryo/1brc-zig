@@ -114,7 +114,7 @@ fn process(table: *Table, gpa: std.mem.Allocator, data: []const u8) !void {
     }
 }
 
-// 観測所名の先頭 16 バイト
+// 観測所名の先頭 16 バイト（Apple Silicon の SIMD レジスタサイズに合わせる）
 // 名前より後ろは 0 で埋める
 // ';' を探すときに読んだバイト列を、ハッシュと比較にそのまま使い回すために持つ
 const Prefix = @Vector(16, u8);
@@ -128,12 +128,17 @@ fn scanName(data: []const u8, pos: *usize) Prefix {
         if (mask != 0) {
             const len: u8 = @ctz(mask);
             pos.* = start + len;
+            // chunk には ';' 以降（気温や次の行）も入っているので、名前の部分だけ残して 0 で埋める
+            // 同じ観測所でも後ろに続く内容は行ごとに違い、そのままではハッシュと比較が一致しない
+            // iota は { 0, 1, ..., 15 } で、len 未満のレーンだけ keep が true になる
+            // 例: "Hamburg;12.0\nBul" (len = 7) -> "Hamburg" + 0 x 9
             const keep = std.simd.iota(u8, 16) < @as(Prefix, @splat(len));
             return @select(u8, keep, chunk, @as(Prefix, @splat(0)));
         }
         pos.* = findSemicolon(data, start + 16);
         return chunk;
     }
+
     // バッファ末尾の 16 バイト未満は 1 バイトずつ読む
     pos.* = findSemicolon(data, start);
     var prefix: [16]u8 = @splat(0);
@@ -147,6 +152,11 @@ fn findSemicolon(data: []const u8, start: usize) usize {
     var i = start;
     while (i + 16 <= data.len) : (i += 16) {
         const chunk: Prefix = data[i..][0..16].*;
+        // @splat(';') は 0x3B を 16 レーンに並べたベクトル
+        // レーンごとに比べた結果を u16 にすると ';' の位置のビットが立つ（レーン 0 が最下位ビット）
+        // `==` はレーンごとの比較
+        // 例: "Hamburg;12.0\nBul" -> 0x0080
+        //     @ctz で最初の ';' の位置 7 が分かる
         const mask: u16 = @bitCast(chunk == @as(Prefix, @splat(';')));
         if (mask != 0) return i + @ctz(mask);
     }
