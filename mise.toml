@@ -1,0 +1,35 @@
+[tools]
+java = "21.0.2"
+zig = "0.17.1"
+
+[tasks.gen]
+description = "Generate measurements.txt (default: 1 billion rows)"
+usage = 'arg "[rows]" default="1000000000"'
+run = 'java 1brc/src/main/java/dev/morling/onebrc/CreateMeasurements.java ${usage_rows}'
+
+[tasks.baseline]
+description = "Write expected output for measurements.txt to measurements.out"
+sources = ["measurements.txt"]
+outputs = ["measurements.out"]
+run = 'java 1brc/src/main/java/dev/morling/onebrc/CalculateAverage_baseline.java > measurements.out'
+
+[tasks.test]
+description = "Compare output with 1brc test samples"
+run = '''
+set -e
+zig build -Doptimize=ReleaseFast
+for f in 1brc/src/test/resources/samples/*.txt; do
+  zig-out/bin/1brc "$f" | cmp - "${f%.txt}.out" || { echo "NG: $f"; exit 1; }
+done
+echo OK
+'''
+
+[tasks.check]
+description = "Compare output for measurements.txt with baseline"
+depends = ["baseline"]
+run = '''
+set -e
+zig build -Doptimize=ReleaseFast
+zig-out/bin/1brc measurements.txt | cmp - measurements.out
+echo OK
+'''

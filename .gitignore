@@ -1,0 +1,4 @@
+measurements.txt
+measurements*.out
+zig-out/
+.zig-cache/

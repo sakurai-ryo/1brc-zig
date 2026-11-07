@@ -1,0 +1,4 @@
+[submodule "1brc"]
+	path = 1brc
+	url = https://github.com/gunnarmorling/1brc.git
+	shallow = true
