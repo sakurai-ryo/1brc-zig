@@ -1,4 +1,6 @@
 [tools]
+"aqua:mstange/samply" = "0.13.1"
+hyperfine = "2.0.0"
 java = "21.0.2"
 zig = "0.17.1"
 
@@ -13,11 +15,13 @@ sources = ["measurements.txt"]
 outputs = ["measurements.out"]
 run = 'java 1brc/src/main/java/dev/morling/onebrc/CalculateAverage_baseline.java > measurements.out'
 
+[tasks.build]
+run = 'zig build -Doptimize=ReleaseFast'
+
 [tasks.test]
 description = "Compare output with 1brc test samples"
+depends = ["build"]
 run = '''
-set -e
-zig build -Doptimize=ReleaseFast
 for f in 1brc/src/test/resources/samples/*.txt; do
   zig-out/bin/1brc "$f" | cmp - "${f%.txt}.out" || { echo "NG: $f"; exit 1; }
 done
@@ -26,10 +30,28 @@ echo OK
 
 [tasks.check]
 description = "Compare output for measurements.txt with baseline"
-depends = ["baseline"]
+depends = ["build", "baseline"]
+run = 'zig-out/bin/1brc measurements.txt | cmp - measurements.out && echo OK'
+
+# 本家の評価と同じく 5 回測る
+# 本家は最速と最遅を除いた 3 回の平均を採る
+[tasks.bench]
+description = "Measure execution time with hyperfine"
+depends = ["build"]
+usage = 'arg "[file]" default="measurements.txt"'
+run = 'hyperfine --warmup 1 --runs 5 "zig-out/bin/1brc ${usage_file}"'
+
+[tasks.profile]
+description = "Record a CPU profile with samply and open it in Firefox Profiler"
+depends = ["build"]
+usage = 'arg "[file]" default="measurements.txt"'
+run = 'samply record -- zig-out/bin/1brc "${usage_file}" > /dev/null'
+
+[tasks.profile-report]
+description = "Record a CPU profile with samply and print it as text tables"
+depends = ["build"]
+usage = 'arg "[file]" default="measurements.txt"'
 run = '''
-set -e
-zig build -Doptimize=ReleaseFast
-zig-out/bin/1brc measurements.txt | cmp - measurements.out
-echo OK
+samply record --save-only --rate 10000 -o profile.json.gz -- zig-out/bin/1brc "${usage_file}" > /dev/null
+python3 scripts/profile_report.py profile.json.gz zig-out/bin/1brc
 '''

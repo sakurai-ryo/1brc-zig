@@ -2,3 +2,4 @@ measurements.txt
 measurements*.out
 zig-out/
 .zig-cache/
+profile.json.gz
