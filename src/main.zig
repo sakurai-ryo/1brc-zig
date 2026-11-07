@@ -54,12 +54,21 @@ pub fn main(init: std.process.Init) !void {
     defer file.close(io);
 
     const len = try file.length(io);
-    var next_chunk: std.atomic.Value(u64) = .init(0);
+    // 長さ 0 の mmap は失敗するので、空ファイルは読まずに済ませる
+    var mm: ?Io.File.MemoryMap = if (len == 0) null else try file.createMemoryMap(io, .{
+        .len = len,
+        .protection = .{ .read = true },
+        .populate = false,
+    });
+    defer if (mm) |*m| m.destroy(io);
+    const data: []const u8 = if (mm) |m| m.memory else "";
+
+    var next_chunk: std.atomic.Value(usize) = .init(0);
     const n_threads = try std.Thread.getCpuCount();
     const workers = try arena.alloc(Worker, n_threads);
     const threads = try arena.alloc(std.Thread, n_threads);
     for (workers, threads) |*w, *t| {
-        w.* = .{ .file = file, .io = io, .len = len, .next_chunk = &next_chunk };
+        w.* = .{ .data = data, .next_chunk = &next_chunk };
         t.* = try std.Thread.spawn(.{}, Worker.run, .{w});
     }
     for (threads) |t| t.join();
@@ -100,26 +109,23 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
 }
 
-// offset 以降で最初の行頭の位置を返す。offset がすでに行頭ならそのまま返す
-fn nextLineStart(file: Io.File, io: Io, offset: u64) !u64 {
+// offset 以降で最初の行頭の位置を返す
+// offset がすでに行頭ならそのまま返す
+fn nextLineStart(data: []const u8, offset: usize) usize {
     if (offset == 0) return 0;
-    // 1 行は最長で 100 (名前) + 1 + 5 (気温) + 1 バイトなので、128 バイト読めば改行が見つかる
-    var buf: [128]u8 = undefined;
-    const n = try file.readPositionalAll(io, &buf, offset - 1);
-    const i = std.mem.indexOfScalar(u8, buf[0..n], '\n') orelse return offset - 1 + n;
-    return offset + i;
+    const i = std.mem.indexOfScalarPos(u8, data, offset - 1, '\n') orelse return data.len;
+    return i + 1;
 }
 
-// ファイルを chunk_size ごとの塊に分け、各スレッドが空き次第つぎの塊を取って処理する。
-// 均等に分けると、Apple Silicon では高性能コアのスレッドが先に終わって高効率コアを待つことになる。
+// ファイルを chunk_size ごとの塊に分け、各スレッドが空き次第つぎの塊を取って処理する
+// 均等に分けると、Apple Silicon では高性能コアのスレッドが先に終わって高効率コアを待つことになる
 // 表とメモリはスレッドごとに持つので、塊の取得以外にスレッド間の同期は要らない
 const Worker = struct {
+    // 16 MiB
     const chunk_size = 16 << 20;
 
-    file: Io.File,
-    io: Io,
-    len: u64,
-    next_chunk: *std.atomic.Value(u64),
+    data: []const u8,
+    next_chunk: *std.atomic.Value(usize),
     arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
     table: Table = undefined,
     err: ?anyerror = null,
@@ -133,36 +139,14 @@ const Worker = struct {
     fn runInner(w: *Worker) !void {
         const gpa = w.arena.allocator();
         w.table = try .init(gpa);
-        // ファイル全体を mmap すると、ページキャッシュに収まらないときに 16KB ごとの同期読み込みになって遅い
-        // なので、read() で大きめに読めばカーネルの先読みが効く
-        const buf = try gpa.alloc(u8, 1 << 20);
         while (true) {
             const i = w.next_chunk.fetchAdd(1, .monotonic);
-            if (i * chunk_size >= w.len) break;
+            if (i * chunk_size >= w.data.len) break;
             // 塊の境界を次の行頭に合わせ、行頭が [begin, end) にある行を担当する
-            const begin = try nextLineStart(w.file, w.io, i * chunk_size);
-            const end = try nextLineStart(w.file, w.io, @min((i + 1) * chunk_size, w.len));
-            try w.processRange(gpa, buf, begin, end);
+            const begin = nextLineStart(w.data, i * chunk_size);
+            const end = nextLineStart(w.data, @min((i + 1) * chunk_size, w.data.len));
+            try process(&w.table, gpa, w.data[begin..@max(begin, end)]);
         }
-    }
-
-    fn processRange(w: *Worker, gpa: std.mem.Allocator, buf: []u8, begin: u64, end: u64) !void {
-        var carry: usize = 0;
-        var offset = begin;
-        while (offset < end) {
-            const want: usize = @intCast(@min(buf.len - carry, end - offset));
-            const n = try w.file.readPositional(w.io, &.{buf[carry..][0..want]}, offset);
-            if (n == 0) break;
-            offset += n;
-            const filled = carry + n;
-            // 最後の改行までを処理し、途中で切れた行は次の読み込みの先頭に繰り越す
-            const stop = if (std.mem.lastIndexOfScalar(u8, buf[0..filled], '\n')) |i| i + 1 else 0;
-            try process(&w.table, gpa, buf[0..stop]);
-            std.mem.copyForwards(u8, buf, buf[stop..filled]);
-            carry = filled - stop;
-        }
-        // 末尾に改行のないファイルの最終行
-        try process(&w.table, gpa, buf[0..carry]);
     }
 };
 
