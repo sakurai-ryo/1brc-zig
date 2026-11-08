@@ -193,7 +193,7 @@ fn scanName(lines: []const u8, cursor: *usize) Prefix {
             const is_name_byte = std.simd.iota(u8, 16) < @as(Prefix, @splat(name_len));
             return @select(u8, is_name_byte, window, @as(Prefix, @splat(0)));
         }
-        // 16 bit までに ';' がないケースはそのまま prefix とする
+        // 16 バイト以内に ';' がない（名前が 16 バイト以上）ときは、読んだ 16 バイトをそのまま prefix とする
         cursor.* = findSemicolon(lines, name_start + 16);
         return window;
     }
